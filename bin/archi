@@ -1,0 +1,136 @@
+#!/bin/bash
+set -eu
+
+GPU_BASE="10de"
+
+declare -A GPU_DEVICES=(
+	["01:00.0"]="1b06"
+	["01:00.1"]="10ef"
+)
+
+VM="win10"
+
+PRINT_USAGE() {
+	echo "Usage: $0 [host/guest]"
+}
+
+IS_SDDM_RUNNING() {
+	sudo pidof "sddm" 1>/dev/null || sudo pidof "Xorg" 1>/dev/null || sudo pidof "kwin_x11" 1>/dev/null
+}
+
+IS_VM_RUNNING() {
+	sudo virsh list --name --state-running | grep -Fq "$VM"
+}
+
+VM_DETACH_GPU() {
+	echo "<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='0x0000' bus='0x04' slot='0x00' function='0x0'/></source></hostdev>" > "/tmp/archi_gpu.xml"
+	virsh detach-device "$VM" "/tmp/archi_gpu.xml"
+	rm -f "/tmp/archi_gpu.xml"
+}
+
+if [[ "$#" -lt 1 ]]; then
+	PRINT_USAGE
+	exit 1
+fi
+
+echo "Verifying root access..."
+sudo -v
+echo "Root access confirmed!"
+
+if [[ "$1" != "--background" ]]; then
+	sudo nohup "$0" --background "$@" &>/dev/null & disown
+	exit 0
+fi
+
+case "$2" in
+	"guest")
+		RESTART_SDDM=0
+
+		# Disable dedicated GPU
+		if [[ -f "/etc/X11/xorg.conf" && ! -f "/etc/X11/xorg.conf.bak" ]]; then
+			RESTART_SDDM=1
+			sudo mv /etc/X11/xorg.conf /etc/X11/xorg.conf.bak
+		fi
+
+		# Load required modules
+		sudo modprobe vfio-pci
+
+		# Shutdown xorg on dedicated GPU
+		# TODO: Find out if we can keep xorg session alive
+		if [[ "$RESTART_SDDM" -eq 1 ]] && IS_SDDM_RUNNING; then
+			sudo systemctl stop sddm
+
+			while IS_SDDM_RUNNING; do
+				sleep 1
+			done
+
+			sleep 1
+		fi
+
+		sudo modprobe -r nvidia
+
+		# Hotplug dedicated GPU for VM
+		for GPU_DEVICE in "${!GPU_DEVICES[@]}"; do
+			GPU_ID="${GPU_DEVICES[$GPU_DEVICE]}"
+			echo "Plugging to vfio-pci: ${GPU_DEVICE}, ${GPU_BASE}:${GPU_ID}..."
+
+			echo "${GPU_BASE} ${GPU_ID}" | sudo tee "/sys/bus/pci/drivers/vfio-pci/new_id" 1>/dev/null
+			echo "0000:${GPU_DEVICE}" | sudo tee "/sys/bus/pci/devices/0000:${GPU_DEVICE}/driver/unbind" 1>/dev/null
+			echo "0000:${GPU_DEVICE}" | sudo tee "/sys/bus/pci/drivers/vfio-pci/bind" 1>/dev/null
+			echo "${GPU_BASE} ${GPU_ID}" | sudo tee "/sys/bus/pci/drivers/vfio-pci/remove_id" 1>/dev/null
+		done
+
+		# Start VM
+		sudo virsh start "$VM"
+
+		# Start xorg on integrated GPU
+		if [[ "$RESTART_SDDM" -eq 1 ]]; then
+			sudo systemctl start sddm
+		fi
+	;;
+	"host")
+		# Stop VM
+		if IS_VM_RUNNING; then
+			sudo virsh shutdown "$VM"
+
+			while IS_VM_RUNNING; do
+				sleep 1
+			done
+		fi
+
+		RESTART_SDDM=0
+
+		# Enable dedicated GPU
+		if [[ -f "/etc/X11/xorg.conf.bak" && ! -f "/etc/X11/xorg.conf" ]]; then
+			RESTART_SDDM=1
+			sudo mv "/etc/X11/xorg.conf.bak" "/etc/X11/xorg.conf"
+		fi
+
+		# Shutdown xorg on integrated GPU
+		if [[ "$RESTART_SDDM" -eq 1 ]] && IS_SDDM_RUNNING; then
+			sudo systemctl stop sddm
+
+			while IS_SDDM_RUNNING; do
+				sleep 1
+			done
+
+			sleep 1
+		fi
+
+		# Hotplug dedicated GPU back to host
+		for GPU_DEVICE in "${!GPU_DEVICES[@]}"; do
+			echo "Unplugging from vfio-pci: ${GPU_DEVICE}..."
+			echo 1 | sudo tee "/sys/bus/pci/devices/0000:${GPU_DEVICE}/remove" 1>/dev/null
+		done
+
+		echo 1 | sudo tee "/sys/bus/pci/rescan" 1>/dev/null
+
+		# Start xorg on dedicated GPU
+		if [[ "$RESTART_SDDM" -eq 1 ]]; then
+			sudo systemctl start sddm
+		fi
+	;;
+	*) PRINT_USAGE; exit 1
+esac
+
+echo "Done!"
